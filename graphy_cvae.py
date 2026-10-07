@@ -1,520 +1,202 @@
-import numpy as np
-import random
-
 import torch
+import numpy as np
+import pandas as pd
 from torch_geometric.data import Data
+from sklearn.model_selection import train_test_split
 
-from pymatgen.core import Structure, PeriodicSite, DummySpecie, Element
-from pymatgen.core.periodic_table import Element as PMGElement
+from pymatgen.core import Structure, DummySpecie, Element
 from pymatgen.analysis.local_env import MinimumDistanceNN
-# from mp_api.client import MPRester
+from pymatgen.analysis.graphs import StructureGraph
 
-masking_dict = {
-    "GaSe": {"to_sub":["In", "S"],  "possible_defects": [3, 7, 10, 14, 18]},
-    "InSe": {"to_sub":["Ga", "S"],  "possible_defects": [3, 7, 10, 14, 18]},
-    "BN"  : {"to_sub":["C"],        "possible_defects": [3, 6,  9, 12, 16]},
-    "P"   : {"to_sub":["N"],        "possible_defects": [3, 7, 10, 14, 18]},
-    "WSe2": {"to_sub":["Mo", "S"],  "possible_defects": [1,2,3,4, 9, 14, 19, 24]},
-    "MoS2": {"to_sub":["W", "Se"],  "possible_defects": [1,2,3,4, 9, 14, 19, 24]}
-}
-
-the_materials_list = list(masking_dict.keys())
-
-# ==============================
-# FULL DEFECTIVE STRUCTURE
-# ==============================
-
-def struct_to_dict(structure):
-    rounded_coords = np.round(structure.frac_coords, 3)
-    return {tuple(coord): site for coord, site in zip(rounded_coords, structure.sites)}
-
-
-def align_to_reference_lattice(defective_struct, reference_struct):
-    if not np.allclose(defective_struct.lattice.matrix,
-                       reference_struct.lattice.matrix,
-                       atol=1e-6):
-        frac_coords = reference_struct.lattice.get_fractional_coords(defective_struct.cart_coords)
-        frac_coords = np.mod(frac_coords, 1.0)
-        return Structure(reference_struct.lattice,
-                         defective_struct.species,
-                         frac_coords,
-                         coords_are_cartesian=False)
-    return defective_struct
-
-
-def get_full_defective(reference_struct, defective_struct):
-    # mindnn = MinimumDistanceNN()
-    # Align the lattice
-    if reference_struct.lattice != defective_struct.lattice:
-        defective_struct = align_to_reference_lattice(defective_struct, reference_struct)
-    else:
-        pass
-
-    # struct to dict
-    defective_dict = struct_to_dict(defective_struct)
-    reference_dict = struct_to_dict(reference_struct)
-
-    # Get lattice of defective structure
-    structure_lattice = defective_struct.lattice
-
-    # List to add all defect sites
-    defective_structure_list = []
-
-    # Dictionary to hold properties of each site
-    defects_properties = {}
-
-    ref_index = 0
-
-    for ref_coord, ref_site in reference_dict.items():
-        # Use the reference coordinates to get the defective site
-        ref_index = ref_index + 1
-
-        def_site = defective_dict.get(ref_coord)
-
-        if def_site:  # The site is found in both the reference structure and the defective structure
-            # But are the species the same?
-            ref_specie = ref_site.specie
-            def_specie = def_site.specie
-            if ref_specie != def_specie:  # Substitution
-                # Add site to defects list
-                defective_structure_list.append(def_site)
-
-                # Get atomic number change and defect type
-                add_property = {
-                    "original_Z":ref_specie.Z,
-                    "new_Z": def_specie.Z,
-
-                    "original_en": ref_specie.X,
-                    "new_en": def_specie.X,
-
-                    "original_ar": ref_specie.atomic_radius,
-                    "new_ar": def_specie.atomic_radius,
-
-                    "original_row": ref_specie.row,
-                    "new_row": def_specie.row,
-
-                    "original_group": ref_specie.group,
-                    "new_group": def_specie.group,
-
-                    "original_max_os": max(ref_specie.common_oxidation_states),
-                    "new_max_os": max(def_specie.common_oxidation_states) if def_specie.common_oxidation_states else 0,
-
-                    "original_ef": ref_specie.electron_affinity,
-                    "new_ef": def_specie.electron_affinity,
-
-                    "vacancy_defect": 0.0,
-                    "substitution_defect": 1.0,
-                    "normal_site":0.0,
-                }
-
-                defects_properties[def_site] = add_property
-            else: # Normal site
-                defective_structure_list.append(ref_site)
-
-                add_property = {
-                    "original_Z":ref_specie.Z,
-                    "new_Z": ref_specie.Z,
-
-                    "original_en": ref_specie.X,
-                    "new_en": ref_specie.X,
-
-                    "original_ar": ref_specie.atomic_radius,
-                    "new_ar": ref_specie.atomic_radius,
-
-                    "original_row": ref_specie.row,
-                    "new_row": ref_specie.row,
-
-                    "original_group": ref_specie.group,
-                    "new_group": ref_specie.group,
-
-                    "original_max_os": max(ref_specie.common_oxidation_states),
-                    "new_max_os": max(ref_specie.common_oxidation_states),
-
-                    "original_ef": ref_specie.electron_affinity,
-                    "new_ef": ref_specie.electron_affinity,
-
-                    "vacancy_defect": 0.0,
-                    "substitution_defect": 0.0,
-                    "normal_site":1.0
-                }
-
-                defects_properties[ref_site] = add_property
-
-    
-        else: # the site from ref_structure is not found in defective structure
-            # This means that the site is a vacancy site
-            # Add site to defective structure
-            vacant_site = PeriodicSite(
-                species= DummySpecie(),
-                coords= ref_coord,
-                coords_are_cartesian= False,
-                lattice= structure_lattice
-                )
-
-            # Add site to defects list
-            defective_structure_list.append(vacant_site)
-
-            ref_specie = ref_site.specie
-
-            # Get atomic number change and defect type
-            add_property={
-                "original_Z":ref_specie.Z,
-                "new_Z": 0,
-
-                "original_en": ref_specie.X,
-                "new_en": 0.0,
-
-                "original_ar": ref_specie.atomic_radius,
-                "new_ar": 0.0,
-
-                "original_row": ref_specie.row,
-                "new_row": 0,
-
-                "original_group": ref_specie.group,
-                "new_group": 0,
-
-                "original_max_os": max(ref_specie.common_oxidation_states),
-                "new_max_os": 0,
-
-                "original_ef": ref_specie.electron_affinity,
-                "new_ef": 0.0,
-                
-                "vacancy_defect": 1.0,
-                "substitution_defect": 0.0,
-                "normal_site":0.0
-
-            }
-            defects_properties[vacant_site] = add_property
-
-    # create a defects structure
-    defective_struct = Structure.from_sites(defective_structure_list)
-
-    # Add properties to defects structure
-    for a_site in defective_struct.sites:
-        if a_site in defects_properties.keys():
-            a_site.properties.update(defects_properties[a_site])
-        else:
-            pass
-
-    return defective_struct
-
-# =====================
-# CLOUD STRUCTURRE
-# =====================
-
-def get_cloud(full_defective_structure, pristine_structure):
-
-    full_defective_copy = full_defective_structure.copy()
-    
-    cloud_list = []
-
-    for p,d in zip(pristine_structure.sites, full_defective_copy.sites):
-        if p.specie != d.specie:
-            cloud_list.append(d)
-
-    cloud_structure = Structure.from_sites(cloud_list)
-        
-    return cloud_structure
-
-# =================
-# NODES
-# =================
-
-def get_nodes(full_defective_structure):
-    all_sites = full_defective_structure.sites
-
-    nodes = []
-    for site in all_sites:
-        coords = site.frac_coords.tolist()
-        site_features = [
-            site.properties["new_Z"]/94,
-            site.properties["new_ar"],
-            site.properties["new_ef"],
-            site.properties["new_en"]/4,
-            site.properties["new_group"]/18,
-            site.properties["new_max_os"],
-            site.properties["new_row"]/9,
-            
-            site.properties["original_Z"]/94,
-            site.properties["original_ar"],
-            site.properties["original_ef"],
-            site.properties["original_en"]/4,
-            site.properties["original_group"]/18,
-            site.properties["original_max_os"],
-            site.properties["original_row"]/9,
-
-            site.properties["vacancy_defect"],
-            site.properties["substitution_defect"],
-            # site.properties["normal_site"],
-        ]
-        nodes.append(coords + site_features)
-
-    # len_nodes = len(nodes)
-
-    # if len_nodes < max_points:
-        # Pad with zeros
-        # padding_nodes = [[0.0]*len(nodes[0])]*(max_points - len_nodes)
-        # nodes.extend(padding_nodes)
-
-    return nodes
-
-# ============================
-# EDGES
-# ============================
-
-def get_edges(full_defective_structure):
-    nn = MinimumDistanceNN()
-
-    edges = []
-    from_edges = []
-    to_edges = []
-
-    # Get all the defective sites and their indices. Runs once through the structure
-    defective_sites = []
-    defective_sites_indices = []
-
-    for indx, site in enumerate(full_defective_structure.sites):
-        if site.properties["normal_site"] != 1:
-            defective_sites.append(site) 
-            defective_sites_indices.append(indx)
-            
-        else:
-            continue 
-
-    # Get nearest defect site of every site
-    for i, site_i in enumerate(full_defective_structure.sites):
-        to_i = []
-
-        dist_to_defect = [site_i.distance(def_site) for def_site in defective_sites]
-
-        sorted_distances = sorted(dist_to_defect)
-        len_sorted = len(sorted_distances)
-
-        if sorted_distances[0] == 0.0 and len_sorted > 1:
-            min_dist = sorted_distances[1]
-        elif sorted_distances[0] != 0.0 and len_sorted > 1:
-            min_dist = sorted_distances[0]
-        else:
-            min_dist  = sorted_distances[0]
-
-        # Which defect site?
-        min_idx = dist_to_defect.index(min_dist)
-
-        # focus_defect_site = defective_sites[min_idx]
-        focus_defect_index = defective_sites_indices[min_idx]
-        to_i.append(focus_defect_index)
-        
-
-            
-        nn_info = nn.get_nn_info(full_defective_structure, i)
-        for info in nn_info:
-            nbr_site = info["site"]
-            j = int(info["site_index"])  # often available
-            to_i.append(j)
-
-        # Remove duplicates in to_i
-        unique_j = list(set(to_i))
-        from_i = [i] * len(unique_j)
-        for a,b in zip(from_i, unique_j):
-            from_edges.append(a)
-            to_edges.append(b)
-
-
-    # Create a list of tuples
-    edge_pairs = list(zip(from_edges, to_edges))
-
-    new_edge_pairs = []
-    for pair in edge_pairs:
-        if pair[0] != pair[1]:
-            one_pair = frozenset(pair)
-        else:
-            one_pair = pair
-        new_edge_pairs.append(one_pair)
-
-    unique_edge_pairs = list(set(new_edge_pairs))
-
-    from_edges, to_edges = map(list, zip(*unique_edge_pairs))
-
-
-    edges.append(from_edges)
-    edges.append(to_edges)
-
-    return edges
-
-# ====================
-# EDGE FEATURES
-# ====================
-
-def get_features(edges, full_defective_structure):
-
-    full_defective_sites = full_defective_structure.sites
-    a_lat = float(full_defective_structure.lattice.a)
-
-    from_edges = edges[0]
-    to_edges = edges[1]
-
-    edge_features = []
-
-    for idx_i, idx_j in zip(from_edges, to_edges):
-        site_i = full_defective_sites[idx_i]
-        site_j = full_defective_sites[idx_j]
-
-        dist = site_i.distance(site_j)
-
-        cart_i = site_i.coords
-        cart_j = site_j.coords
-        r_vec = cart_j - cart_i
-        r_ij = float(np.linalg.norm(r_vec))
-
-        dist_angstrom = r_ij
-        dist_norm = dist
-        dist_lattice_units = r_ij/a_lat
-
-        q_i = site_i.properties["new_max_os"]
-        q_j = site_j.properties["new_max_os"]
-
-        if site_i.properties["vacancy_defect"] == 1:
-            q_i = -q_i
-
-        if site_j.properties["vacancy_defect"] == 1:
-            q_j = -q_j
-
-        charge_product = q_i * q_j
-        screened_coulomb = (q_i * q_j) / (r_ij) if r_ij > 0 else 0.0
-
-        # Angular factor
-        if r_ij > 0:
-            cos_theta = r_vec[2]/ r_ij
-            angular_factor = 1.0-3.0 * cos_theta ** 2
-        else:
-            angular_factor = 0.0
-
-        the_features = [
-            dist, dist_angstrom, dist_norm, dist_lattice_units,
-            charge_product, screened_coulomb,angular_factor
-        ]
-        edge_features.append(the_features)
-
-    return edge_features
+from structure_manipulation import clean_defective_manipulation
+from graphy_gnn_copy import get_nodes, get_edges_and_features, get_globals
 
 # ==========
 #  MASK
 # ==========
 
-def get_mask(reference_structure):
-    ref_material = reference_structure.reduced_formula
-    # len_ref_sites = len(reference_structure)
+def get_mask(pristine_structure):
+    masking_dict = {
+        "Ga":"In", "Se":"S", "In":"Ga", 
+        "B":"C", "N":"C", "P":"N", 
+        "W":"Mo", "Mo":"W", "S":"Se"
+    }
 
-    positive_mask = np.zeros(119, dtype=bool)
-    positive_mask[0] = True   # vacancy always valid
+    the_masks = []
 
-    allowed_subs = masking_dict[ref_material]["to_sub"]
+    for site in pristine_structure.sites:
+        specie_now = site.specie.symbol
 
-    for i in allowed_subs:
-        allowed_elem_z = Element(i).Z
-        positive_mask[allowed_elem_z] = True
+        # Normal site 
+        norm = site.specie.Z
 
-    # return torch.tensor([positive_mask] * len_ref_sites, dtype=torch.bool)
-    return positive_mask
+        # Vacancy site
+        vac = 0
+
+        # Sub site
+        allowed_sub = masking_dict[specie_now]
+        sub = Element(allowed_sub).Z
+
+        # The row mask
+        row_mask = [norm, vac, sub]
+        
+        the_masks.append(row_mask)
+
+    
+    return the_masks
 
 # ====================
-# GLOBAL ATTRIBUTES
+# PRISTINE NODES
 # ====================
+def get_pristine_nodes(pristine_structure):
+    
+    all_features= []
+    for a_site in pristine_structure.sites:
+        coords = a_site.coords
 
-def get_globals(the_material, bgv):
-    one_hot = [1 if a_material == the_material else 0 for a_material in the_materials_list]
-    global_list = one_hot + [bgv]
-    return global_list
+        all_features.append(coords)
 
-# ======================
-# NUMBER OF DEFECTS
-# ======================
+    return all_features
 
-def get_num_defects(the_material):
-    poss_ds = masking_dict[the_material]["possible_defects"]
-    the_ds = random.choice(poss_ds)
-    return the_ds
+# ====================
+# PRISTINE EDGES
+# ====================
+def get_pristine_edges(pristine_structure):
+    # 2. Generate a StructureGraph using a neighbor strategy (e.g., CrystalNN)
+    mdnn = MinimumDistanceNN()
+    the_graph = StructureGraph.from_local_env_strategy(pristine_structure, mdnn)
+
+    # 3. Extract edge indices (COO format: [source_indices, target_indices])
+    edge_indices = []
+    for u, v, _ in the_graph.graph.edges(data=True):
+        edge_indices.append([u, v])
+        edge_indices.append([v, u])
+
+    edge_indices = np.array(edge_indices).T  # Shape: (2, num_edges)
+    return edge_indices
+
 
 # =======================
 # CVAE TARGET
 # =======================
 
 def get_target_tensor(full_defective_structure):
-    
-    orig_z, new_z = [],[]
-
+    new_z = []
     for site in full_defective_structure.sites:
-        z_org = site.properties["original_Z"]
-        z_new = site.properties["new_Z"]
-        
-        orig_z.append(z_org)
-        new_z.append(z_new)
+        the_specie = site.specie
 
-    # Sites
-    site_targets = [0 if oz == nz else 1 for oz, nz in zip(orig_z, new_z)]
-    site_targets = np.array(site_targets).T
+        if the_specie == DummySpecie():
+            the_z = 0
+        else:
+            the_z = the_specie.Z
 
-    # s_mask = site_targets.unsqueeze(-1).to(device=start_x.device)
-    
-    # Species
-    species_targets = []
-    
-    for z in new_z:
-        one_hot = [1 if i == z else 0 for i in range(119)]
-        species_targets.append(one_hot)
+        new_z.append(the_z)
 
-    species_targets = np.array(species_targets)
-    
-    # Concatenate along axis 1
-    # result = np.concatenate([site_targets, species_targets], axis=1)
-    result = np.hstack((site_targets[:, np.newaxis], species_targets))
-    return result
+    return new_z
 
 # =========================
 # COMBINE TO GET GRAPHS
 # =========================
 
-def get_graphs(material_dataset):
+def get_encoder_data(cloud_structure, clean_defective_structure, ref_structure):
+    gnn_nodes = get_nodes(cloud_structure, ref_structure)
+
+    encoder_nodes = []
+    for cloud_site, nodes_i in zip(cloud_structure, gnn_nodes):
+        
+        encoder_nodes.append(np.concatenate([nodes_i, cloud_site.frac_coords]))
+
+    edges, edge_features = get_edges_and_features(gnn_nodes, cloud_structure, ref_structure)
+    
+    len_reference = len(ref_structure)
+    len_clean_defective = len(clean_defective_structure)
+    
+    global_features = get_globals(gnn_nodes, len_clean_defective, len_reference)
+
+    return (encoder_nodes, edges, edge_features, global_features)
+
+def get_decoder_data(full_defective_structure, ref_structure):
+    the_mask = get_mask(ref_structure)
+    pristine_nodes = get_pristine_nodes(ref_structure)
+    pristine_edges = get_pristine_edges(ref_structure)
+    the_target    = get_target_tensor(full_defective_structure)
+
+    return (the_mask, pristine_nodes, pristine_edges, the_target)
+
+
+
+def cvae_graphy(target, clean_defective_structure, ref_structure):
+    full_defective_structure = clean_defective_manipulation(clean_defective_structure, ref_structure, get_full_defective=True)
+    cloud_structure = clean_defective_manipulation(clean_defective_structure, ref_structure, get_cloud=True)
+
+    for_encoder = get_encoder_data(cloud_structure, clean_defective_structure, ref_structure)
+
+    for_decoder = get_decoder_data(full_defective_structure, ref_structure)
+
+    the_data = Data(
+        x          =torch.tensor(for_encoder[0], dtype=torch.float),
+        edge_index =torch.tensor(for_encoder[1], dtype=torch.long),
+        edge_attr  =torch.tensor(for_encoder[2], dtype=torch.float),
+        u          =torch.tensor(for_encoder[3], dtype=torch.float).unsqueeze(0), 
+        bgv        =torch.tensor([target], dtype=torch.float),
+        mask       =torch.tensor(for_decoder[0], dtype=torch.long),
+        pristine_x =torch.tensor(for_decoder[1], dtype=torch.float),
+        pristine_e =torch.tensor(for_decoder[2], dtype=torch.long),
+        y          =torch.tensor(for_decoder[3], dtype=torch.long), 
+    )
+
+    return the_data
+
+def fast_cvae_graphy(material_dataset):
     data_list = []
-    dataset_materials = list(material_dataset["dataset_material"].unique())
-
-    ref_structures = [Structure.from_file(f"Final_Dataset/ref_cifs/{dm}.cif") for dm in dataset_materials]
-    the_masks      = [get_mask(rs) for rs in ref_structures]
-    the_materials  = [dm.split("_")[1] for dm in dataset_materials]
+    dataset_materials = list(material_dataset["dataset_material"].unique())    
     
-    
-    for focus_index, the_dataset_material in enumerate(dataset_materials):
-        # The data, prstine structure, and mask
-        focus_data = material_dataset[material_dataset["dataset_material"] == the_dataset_material]
+    for material in (dataset_materials):
+        ref_structure = Structure.from_file(f"Final_Dataset/ref_cifs/{material}.cif")
+        the_mask = get_mask(ref_structure)
+        pristine_nodes = get_pristine_nodes(ref_structure)
+        pristine_edges = get_pristine_edges(ref_structure)
+        
+        focus_data = material_dataset[material_dataset["dataset_material"] == material]
 
-        ref_structure = ref_structures[focus_index]
-        the_mask      = the_masks[focus_index]
-        the_material  = the_materials[focus_index]
-
-        for index, row in focus_data.iterrows():
+        for _, row in focus_data.iterrows():
             the_id = row["_id"]
-            bgv = row["band_gap_value"]
-            
-            defective_structure      = Structure.from_file(f"original_dataset/{the_dataset_material}/cifs/{the_id}.cif")
-            full_defective_structure = get_full_defective(ref_structure, defective_structure)
-            # cloud_structure        = get_cloud(full_defective_structure)
+            the_bgv = row["band_gap_value"]
 
-            # the_nodes   = get_nodes(cloud_structure, max_points)
-            the_nodes     = get_nodes(full_defective_structure)
-            the_edges     = get_edges(full_defective_structure)
-            the_features  = get_features(the_edges, full_defective_structure)
-            the_condition = get_globals(the_material, bgv)
+            clean_defective_structure  = Structure.from_file(f"original_dataset/{material}/cifs/{the_id}.cif")
+            cloud_structure = clean_defective_manipulation(clean_defective_structure, ref_structure, get_cloud=True)
+            full_defective_structure = clean_defective_manipulation(clean_defective_structure, ref_structure, get_full_defective=True)
+
+            for_encoder = get_encoder_data(cloud_structure, clean_defective_structure, ref_structure)
+
             the_target    = get_target_tensor(full_defective_structure)
             
             data = Data(
-                x          =torch.tensor(the_nodes, dtype=torch.float),
-                edge_index =torch.tensor(the_edges, dtype=torch.long),
-                edge_attr  =torch.tensor(the_features, dtype=torch.float),
-                u          =torch.tensor(the_condition, dtype=torch.float).unsqueeze(0), 
-                mask       =torch.tensor(the_mask, dtype=torch.bool),
-                y          =torch.tensor(the_target, dtype=torch.float)
-                )
+                x          =torch.tensor(for_encoder[0], dtype=torch.float),
+                edge_index =torch.tensor(for_encoder[1], dtype=torch.long),
+                edge_attr  =torch.tensor(for_encoder[2], dtype=torch.float),
+                u          =torch.tensor(for_encoder[3], dtype=torch.float).unsqueeze(0), 
+                bgv        =torch.tensor([the_bgv], dtype=torch.float),
+                mask       =torch.tensor(the_mask, dtype=torch.long),
+                y          =torch.tensor(the_target, dtype=torch.long),
+                pristine_x =torch.tensor(pristine_nodes, dtype=torch.float),
+                pristine_e =torch.tensor(pristine_edges, dtype=torch.long), 
+            )
         
             data_list.append(data)
         
     return data_list
+
+def main():
+    # The Data
+    comb_df = pd.read_csv("Final_Dataset/combined/combined_data.csv")
+    train_set, val_set = train_test_split(comb_df, test_size=0.3, random_state=42, stratify=comb_df["strata"])
+
+    full_train_graphs = fast_cvae_graphy(train_set)
+    full_val_graphs = fast_cvae_graphy(val_set)
+
+    torch.save(full_train_graphs, "Final_Dataset/cvae graphs/cvae_train_graphs.pt")
+    torch.save(full_val_graphs, "Final_Dataset/cvae graphs/cvae_val_graphs.pt")
+
+if __name__ == "__main__":
+    main()
